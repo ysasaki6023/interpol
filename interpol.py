@@ -30,6 +30,7 @@ class BatchGenerator:
     def loadFiles(self,fpaths, cols_to_use):
         self.nfiles = len(fpaths)
         self.fpaths = fpaths
+        self.pList  = []
         self.cols_to_use = cols_to_use
         self.orig   = {}
         self.data   = {}
@@ -38,11 +39,15 @@ class BatchGenerator:
 
         for fpath in fpaths:
             d = pd.read_csv(fpath)
-            print d
+            for a in cols_to_use: assert a in [str(x) for x in d.columns], "col name (%s) is not in the table"%a
             self.data[fpath] = d.as_matrix(columns=cols_to_use)
             self.orig[fpath] = d.as_matrix(columns=cols_to_use)
+            self.pList.append(self.data[fpath].shape[0])
             self.mask[fpath] = (~d.isnull()).as_matrix(columns=cols_to_use)
             self.data[fpath][~self.mask[fpath]] = np.nanmean(self.data[fpath])
+        ptot = sum(self.pList)
+        self.pList = [float(x)/ptot for x in self.pList]
+        print self.pList
         return
 
     def getBatch(self,nLen,nBatch):
@@ -53,7 +58,7 @@ class BatchGenerator:
         self.last_iIdx  = []
         self.last_nLen  = []
         for i in range(nBatch):
-            iFile = np.random.choice(self.fpaths)
+            iFile = np.random.choice(self.fpaths,p=self.pList)
             iIdx  = np.random.randint(0, self.data[iFile].shape[0] - nLen - 1)
             self.last_iFile.append(iFile)
             self.last_iIdx.append(iIdx)
@@ -64,6 +69,7 @@ class BatchGenerator:
         return x,m
 
     def updateData(self,data,p1=1.0,p2=1.0):
+        res = 0.
         for i in range(self.nBatch):
             iFile = self.last_iFile[i]
             iIdx  = self.last_iIdx[i]
@@ -80,16 +86,16 @@ class BatchGenerator:
             flatten_data = flatten_data.reshape([-1])
 
             flatten_orig = self.orig[iFile][iIdx:iIdx+nLen].reshape([-1])
-
             flatten_diff = self.data[iFile][iIdx:iIdx+nLen].reshape([-1])
-
             flatten_merg = alpha * flatten_data + (1.-alpha) * flatten_diff
 
             np.place(flatten_diff,~flatten_m,flatten_merg[~flatten_m])
             diff = np.reshape(flatten_diff,shape)
 
             self.data[iFile][iIdx:iIdx+nLen,:] = diff
-            return
+
+            res += np.sqrt(np.sum(np.power(flatten_diff-flatten_data,2)[flatten_m])/np.maximum(1,np.sum(flatten_m)))
+        return res/self.nBatch
 
 class Interpol:
     def __init__(self,args,ndim,nLen):
@@ -97,10 +103,12 @@ class Interpol:
         self.learnRate = args.learnRate
         self.saveFolder = args.saveFolder
         self.reload = args.reload
+        self.zdim = args.zdim
         self.isTraining = False
         self.ndim = ndim # number of channels
         self.nLen = nLen # input length
         self.buildModel()
+
 
         return
 
@@ -171,7 +179,6 @@ class Interpol:
             # conv1
             self.e_conv1_w, self.e_conv1_b = self._conv_variable([1,10,self.ndim,64],name="conv1")
             h = self._conv2d(h,self.e_conv1_w, stride=1) + self.e_conv1_b
-            h = tf.contrib.layers.batch_norm(h, decay=0.9, updates_collections=None, epsilon=1e-5, scale=True, is_training=self.isTraining, scope="eNorm1")
             h = self.leakyReLU(h)
 
             # conv2
@@ -183,7 +190,18 @@ class Interpol:
             # conv3
             self.e_conv3_w, self.e_conv3_b = self._conv_variable([1,10,128,256],name="conv3")
             h = self._conv2d(h,self.e_conv3_w, stride=1) + self.e_conv3_b
-            h = tf.contrib.layers.batch_norm(h, decay=0.9, updates_collections=None, epsilon=1e-5, scale=True, is_training=self.isTraining, scope="eNorm3")
+            h = self.leakyReLU(h)
+
+            n_b, n_h, n_w, n_f = [int(k) for k in h.get_shape()]
+            h = tf.reshape(h,[n_b,n_h*n_w*n_f])
+
+            # dropout
+            h = tf.nn.dropout(h, 0.5)
+
+            # fc1
+            n_b, n_f = [int(k) for k in h.get_shape()]
+            self.e_fc1_w, self.e_fc1_b = self._fc_variable([n_f,self.zdim],name="fc1")
+            h = tf.matmul(h, self.e_fc1_w) + self.e_fc1_b
             h = self.leakyReLU(h)
 
             ### summary
@@ -194,6 +212,8 @@ class Interpol:
                 tf.summary.histogram("e_conv2_b"   ,self.e_conv2_b)
                 tf.summary.histogram("e_conv3_w"   ,self.e_conv3_w)
                 tf.summary.histogram("e_conv3_b"   ,self.e_conv3_b)
+                tf.summary.histogram("e_fc1_w"     ,self.e_fc1_w  )
+                tf.summary.histogram("e_fc1_b"     ,self.e_fc1_b  )
 
         return h
 
@@ -208,10 +228,17 @@ class Interpol:
 
             h = y
 
+            # fc1
+            self.g_fc1_w, self.g_fc1_b = self._fc_variable([self.zdim,dim_3*1*256],name="fc1")
+            h = tf.matmul(h, self.g_fc1_w) + self.g_fc1_b
+            h = self.leakyReLU(h)
+
+            n_b, _ = [int(k) for k in h.get_shape()]
+            h = tf.reshape(h,[n_b,1,dim_3,256])
+
             # deconv3
             self.g_deconv3_w, self.g_deconv3_b = self._deconv_variable([1,10,256,128],name="deconv3")
             h = self._deconv2d(h,self.g_deconv3_w, output_shape=[self.nBatch,1,dim_2,128], stride=1) + self.g_deconv3_b
-            h = tf.contrib.layers.batch_norm(h, decay=0.9, updates_collections=None, epsilon=1e-5, scale=True, is_training=self.isTraining, scope="gNorm3")
             h = tf.nn.relu(h)
 
             # deconv2
@@ -273,6 +300,8 @@ class Interpol:
 
         step = -1
         start = time.time()
+        estloss = 0
+        estloss_alpha = 0.9
 
         while True:
             step += 1
@@ -280,29 +309,34 @@ class Interpol:
 
             # update generator
             _,z,loss,summary = self.sess.run([self.optimizer,self.z,self.loss,self.summary],feed_dict={self.x:batch_x,self.m:batch_m})
-            bGen.updateData(z, p1=1.0, p2=0.1)
+            estloss *= estloss_alpha
+            estloss += (1-estloss_alpha) * bGen.updateData(z, p1=1.0, p2=0.1)
 
             if step>0 and step%10==0:
                 self.writer.add_summary(summary,step)
 
             if step%100==0:
-                print "%6d: loss=%.4e; time/step = %.2f sec"%(step,loss,time.time()-start)
+                bGen.saveFiles(step)
+                print "%6d: loss(NN)=%.4e; loss(est)=%.4e; time/step = %.2f sec"%(step,loss,estloss,time.time()-start)
                 start = time.time()
                 self.saver.save(self.sess,os.path.join(self.saveFolder,"model.ckpt"),step)
-                bGen.saveFiles(step)
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--inputFiles","-i",dest="inputFiles",type=str,required=True)
+    parser.add_argument("--inputCols","-c",dest="inputCols",type=str,required=True)
     parser.add_argument("--nBatch","-b",dest="nBatch",type=int,default=64)
     parser.add_argument("--nLen"  ,"-n",dest="nLen",type=int,default=64)
     parser.add_argument("--learnRate","-r",dest="learnRate",type=float,default=1e-3)
-    parser.add_argument("--saveFolder","-s",dest="saveFolder",type=str,default="models")
+    parser.add_argument("--modelFolder","-m",dest="modelFolder",type=str,default="models")
+    parser.add_argument("--saveFolder","-s",dest="saveFolder",type=str,default="save")
     parser.add_argument("--reload","-l",dest="reload",type=str,default=None)
+    parser.add_argument("--zdim","-z",dest="zdim",type=int,default=32)
 
     args = parser.parse_args()
 
     bGen = BatchGenerator()
-    bGen.setSaveFolder("save")
-    bGen.loadFiles(["data/data2.csv"],cols_to_use=["col1","col2"])
+    bGen.setSaveFolder(args.saveFolder)
+    bGen.loadFiles(args.inputFiles.split(","),cols_to_use=args.inputCols.split(","))
     p = Interpol(args,bGen.ndim,args.nLen)
     p.train(bGen)
