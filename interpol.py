@@ -38,14 +38,17 @@ class BatchGenerator:
 
         for fpath in fpaths:
             d = pd.read_csv(fpath)
+            print d
             self.data[fpath] = d.as_matrix(columns=cols_to_use)
             self.orig[fpath] = d.as_matrix(columns=cols_to_use)
             self.mask[fpath] = (~d.isnull()).as_matrix(columns=cols_to_use)
+            self.data[fpath][~self.mask[fpath]] = np.nanmean(self.data[fpath])
         return
 
     def getBatch(self,nLen,nBatch):
         x   = np.zeros( (nBatch, 1, nLen, self.ndim ), dtype=np.float32)
         m   = np.zeros( (nBatch, 1, nLen, self.ndim ), dtype=np.bool   )
+        self.nBatch = nBatch
         self.last_iFile = []
         self.last_iIdx  = []
         self.last_nLen  = []
@@ -57,21 +60,35 @@ class BatchGenerator:
             self.last_nLen.append(nLen)
             x[i,0,:,:] = self.data[iFile][iIdx:iIdx+nLen,:]
             m[i,0,:,:] = self.mask[iFile][iIdx:iIdx+nLen,:]
+
         return x,m
 
-    def updateData(self,data):
-        for i in range(self.ndim):
+    def updateData(self,data,p1=1.0,p2=1.0):
+        for i in range(self.nBatch):
             iFile = self.last_iFile[i]
             iIdx  = self.last_iIdx[i]
             nLen  = self.last_nLen[i]
-            m = self.mask[iFile][iIdx:iIdx+nLen,:]
 
+            m = self.mask[iFile][iIdx:iIdx+nLen,:]
             flatten_m    =    m.reshape([-1])
-            flatten_data = data.reshape([-1])
+
+            alpha = (p1-p2) * np.mean(flatten_m.astype(np.float32)) + p2
+
+            flatten_data = data[i]
+            flatten_data = flatten_data.reshape(flatten_data.shape[1:])
+            shape = flatten_data.shape
+            flatten_data = flatten_data.reshape([-1])
+
+            flatten_orig = self.orig[iFile][iIdx:iIdx+nLen].reshape([-1])
+
             flatten_diff = self.data[iFile][iIdx:iIdx+nLen].reshape([-1])
-            np.place(flatten_diff,~flatten_m,flatten_data[~flatten_m])
-            diff = np.reshape(flatten_diff,data.shape)
-            self.data[iFile][iIdx:iIdx+nLen] = diff
+
+            flatten_merg = alpha * flatten_data + (1.-alpha) * flatten_diff
+
+            np.place(flatten_diff,~flatten_m,flatten_merg[~flatten_m])
+            diff = np.reshape(flatten_diff,shape)
+
+            self.data[iFile][iIdx:iIdx+nLen,:] = diff
             return
 
 class Interpol:
@@ -92,7 +109,7 @@ class Interpol:
             # check weight_shape
             input_channels  = int(weight_shape[0])
             output_channels = int(weight_shape[1])
-            weight_shape    = (input_channels, output_channels)
+            weight_shape    = (input_channels, output_channels) 
 
             # define variables
             weight = tf.get_variable("w", weight_shape     , initializer=tf.contrib.layers.xavier_initializer())
@@ -220,7 +237,6 @@ class Interpol:
 
     def buildModel(self):
         # define variables
-        #self.x      = tf.placeholder(tf.float32, [self.nBatch, 1, self.nLen, self.ndim],name="x")
         self.x      = tf.placeholder(tf.float32, [self.nBatch, 1, self.nLen, self.ndim],name="x")
         self.m      = tf.placeholder(tf.bool   , [self.nBatch, 1, self.nLen, self.ndim],name="m")
 
@@ -229,7 +245,6 @@ class Interpol:
 
         # define loss
         self.loss = tf.sqrt(tf.reduce_sum( tf.pow((self.x-self.z),2) * tf.cast(self.m,tf.float32) ) / tf.maximum(tf.reduce_sum(tf.cast(self.m,tf.float32)),1))
-        #self.loss = tf.nn.l2_loss(self.x-self.z)
 
         # define optimizer
         self.optimizer   = tf.train.AdamOptimizer(self.learnRate).minimize(self.loss)
@@ -262,14 +277,10 @@ class Interpol:
         while True:
             step += 1
             batch_x,batch_m = bGen.getBatch(self.nLen,self.nBatch)
-            batch_x[~batch_m] = 0. # dummy
 
             # update generator
             _,z,loss,summary = self.sess.run([self.optimizer,self.z,self.loss,self.summary],feed_dict={self.x:batch_x,self.m:batch_m})
-            for iBatch in range(self.nBatch):
-                item = z[iBatch]
-                item = np.reshape(item, item.shape[1:])
-                bGen.updateData(item)
+            bGen.updateData(z, p1=1.0, p2=0.1)
 
             if step>0 and step%10==0:
                 self.writer.add_summary(summary,step)
@@ -292,6 +303,6 @@ if __name__=="__main__":
 
     bGen = BatchGenerator()
     bGen.setSaveFolder("save")
-    bGen.loadFiles(["data/data.csv"],cols_to_use=["col1","col2"])
+    bGen.loadFiles(["data/data2.csv"],cols_to_use=["col1","col2"])
     p = Interpol(args,bGen.ndim,args.nLen)
     p.train(bGen)
