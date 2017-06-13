@@ -7,11 +7,30 @@ import math,glob,random,time,csv
 
 class BatchGenerator:
     def __init__(self):
+        self.saveFolder = None
         pass
+
+    def setSaveFolder(self,folderPath):
+        self.saveFolder = folderPath
+        if not os.path.exists(self.saveFolder):
+            os.makedirs(self.saveFolder)
+        return
+
+    def saveFiles(self,nIter):
+        for fpath in self.fpaths:
+            d = pd.read_csv(fpath)
+            for iCol,nameCol in enumerate(self.cols_to_use):
+                d[nameCol] = self.data[fpath][:,iCol]
+            if self.saveFolder:
+                saveFileName = os.path.join(self.saveFolder, os.path.basename(fpath.replace(".csv","_%d.csv"%nIter)))
+            else:
+                saveFileName = fpath.replace(".csv","_%d.csv"%nIter)
+            d.to_csv(saveFileName)
 
     def loadFiles(self,fpaths, cols_to_use):
         self.nfiles = len(fpaths)
         self.fpaths = fpaths
+        self.cols_to_use = cols_to_use
         self.orig   = {}
         self.data   = {}
         self.mask   = {}
@@ -46,8 +65,14 @@ class BatchGenerator:
             iIdx  = self.last_iIdx[i]
             nLen  = self.last_nLen[i]
             m = self.mask[iFile][iIdx:iIdx+nLen,:]
-            np.place(self.data[iFile],~m,data[~m])
-            #self.data[iFile][iIdx:iIdx+nLen][~m] = data[~m]
+
+            flatten_m    =    m.reshape([-1])
+            flatten_data = data.reshape([-1])
+            flatten_diff = self.data[iFile][iIdx:iIdx+nLen].reshape([-1])
+            np.place(flatten_diff,~flatten_m,flatten_data[~flatten_m])
+            diff = np.reshape(flatten_diff,data.shape)
+            self.data[iFile][iIdx:iIdx+nLen] = diff
+            return
 
 class Interpol:
     def __init__(self,args,ndim,nLen):
@@ -241,7 +266,10 @@ class Interpol:
 
             # update generator
             _,z,loss,summary = self.sess.run([self.optimizer,self.z,self.loss,self.summary],feed_dict={self.x:batch_x,self.m:batch_m})
-            bGen.updateData(z)
+            for iBatch in range(self.nBatch):
+                item = z[iBatch]
+                item = np.reshape(item, item.shape[1:])
+                bGen.updateData(item)
 
             if step>0 and step%10==0:
                 self.writer.add_summary(summary,step)
@@ -250,6 +278,7 @@ class Interpol:
                 print "%6d: loss=%.4e; time/step = %.2f sec"%(step,loss,time.time()-start)
                 start = time.time()
                 self.saver.save(self.sess,os.path.join(self.saveFolder,"model.ckpt"),step)
+                bGen.saveFiles(step)
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
@@ -262,6 +291,7 @@ if __name__=="__main__":
     args = parser.parse_args()
 
     bGen = BatchGenerator()
-    bGen.loadFiles(["data.csv"],cols_to_use=["col1","col2"])
+    bGen.setSaveFolder("save")
+    bGen.loadFiles(["data/data.csv"],cols_to_use=["col1","col2"])
     p = Interpol(args,bGen.ndim,args.nLen)
     p.train(bGen)
